@@ -304,6 +304,16 @@ class Parser:
 
 class Dataset:
     """A simple dataset class."""
+    # | 参数名           | 作用                                |
+    # | ------------- | --------------------------------- |
+    # | `parser`      | 上面定义的 `Parser` 类，包含所有 COLMAP 处理结果 |
+    # | `split`       | `"train"` 或 `"test"`              |
+    # | `patch_size`  | 如果指定，则会对图像做随机裁剪                   |
+    # | `load_depths` | 是否加载深度投影（可选）                      |
+    # | `start_frame` | 当前 GOP 的起始帧号                      |
+    # | `GOP_size`    | 当前 GOP 的帧数                        |
+    # | `test_set`    | 指定测试的 GOP 编号（如 `[0]` 表示 GOP\_0）   |
+    # | `remove_set`  | 要从训练集中排除的 GOP 编号                  |
 
     def __init__(
         self,
@@ -367,6 +377,28 @@ class Dataset:
             K[0, 2] -= x
             K[1, 2] -= y
 
+
+# 每个GOP中所有图片相同的内容
+#         | 字段           | 说明                                  |
+# | ------------ | ----------------------------------- |
+# | `K`          | 相机内参矩阵，所有帧来自同一个摄像头                  |
+# | `camera_id`  | 恒定为 camera\_0 对应的 ID                |
+# | `camtoworld` | 相机位姿矩阵（整个 GOP 用的是同一帧的，通常是第一帧）       |
+# | `mask`       | 如果存在 mask（如 fisheye），所有帧用的是同一个 mask |
+# 不同的内容：
+# | 字段         | 说明                                     |
+# | ---------- | -------------------------------------- |
+# | `image`    | 当前帧图像（如 cam00 的第 i 帧图像）                |
+# | `image_id` | 样本在整个 `Dataset` 中的索引（0 \~ 239）         |
+# | `time`     | 归一化时间戳：`i / (GOP_size - 1)`，范围 \[0, 1] |
+        # {
+        #     "K": 相机内参 (torch.Tensor, [3, 3]),
+        #     "camtoworld": 外参矩阵 (torch.Tensor, [4, 4]),
+        #     "image": 图像像素值 (torch.Tensor, [H, W, 3]),
+        #     "image_id": 当前帧索引,
+        #     "time": 当前帧在 GOP 中的归一化时间, 例如 0.0 ~ 1.0,
+        #     "camera_id": 当前相机索引
+        # }
         data = {
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
@@ -378,6 +410,7 @@ class Dataset:
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
+        # 点云深度信息部分是注释掉的
         # if self.load_depths:
         #     # projected points to image plane to get depths
         #     worldtocams = np.linalg.inv(camtoworlds)
