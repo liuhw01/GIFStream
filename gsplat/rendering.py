@@ -1504,6 +1504,23 @@ def view_to_visible_anchors(
     assert viewmats.shape == (C, 4, 4), viewmats.shape
     assert Ks.shape == (C, 3, 3), Ks.shape
 
+#     proj_results = fully_fused_projection(
+#     means,         # 高斯中心位置
+#     covars,        # 上三角协方差表示（可选）
+#     quats,         # 四元数（可选）
+#     scales,        # 尺度（可选）
+#     viewmats,      # 相机外参（世界->相机）
+#     Ks,            # 相机内参
+#     width, height, # 图像尺寸
+#     eps2d=eps2d,   # 2D半径最小阈值（用于剔除太小的高斯）
+#     packed=packed, # 是否输出 packed 格式
+#     near_plane=near_plane,
+#     far_plane=far_plane,
+#     radius_clip=radius_clip,  # 半径裁剪阈值（小于此值视为不可见）
+#     sparse_grad=False,  # 是否为稀疏梯度（一般关闭）
+#     calc_compensations=(rasterize_mode == "antialiased"),  # 抗锯齿时启用补偿计算
+#     camera_model=camera_model,
+# )
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
     proj_results = fully_fused_projection(
         means,
