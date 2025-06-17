@@ -183,7 +183,27 @@ def getcolmapsinglen3d(folder, offset):
         destination_file = os.path.join(folder, "sparse", "0", file)
         shutil.move(source_file, destination_file)
 
+#  主要功能概览
+# 从视频中提取图像帧（可选）
+# 构建 COLMAP 所需的输入数据结构
+# 基于 poses_bounds.npy 构建图像姿态与相机参数
+# 调用 COLMAP 执行特征提取、匹配、重建与去畸变
+# 按 GOP 分段进行重建，每个 GOP 对应一个 COLMAP 项目
+
+# ❓为什么这么设计？
+# 这是为了实现 GOP（Group of Pictures）压缩策略：
+# 只在 GOP 的关键帧（每隔 60 帧）上执行 COLMAP 重建
+# 后续帧用其他方式（如 光流估计、运动建模或变形场网络)进行插值/传播
+# 避免对每一帧都做 SfM，提高效率
 if __name__ == "__main__" :
+        # | 参数名                | 含义                  |
+        # | ------------------ | ------------------- |
+        # | `--root_dir`       | 数据集根目录（每个子文件夹是一个场景） |
+        # | `--extract_frames` | 是否从 MP4 中提取帧        |
+        # | `--frame_rate`     | 提取帧率                |
+        # | `--startframe`     | 起始帧索引               |
+        # | `--endframe`       | 终止帧索引               |
+        # | `--GOP`            | GOP 大小（每隔多少帧处理一次）   |
     parser = ArgumentParser(description="dataset information")
     parser.add_argument("--root_dir", type=str, default = None)
     parser.add_argument("--extract_frames", type=bool, action='store_true')
@@ -215,9 +235,21 @@ if __name__ == "__main__" :
                 subprocess.call(cmd, shell=True)
         
         # conduct colmap for GOPs
+        # 🧩 Step 3：准备对每个 GOP 起始帧做 COLMAP 重建
         camera_names = [name for name in os.listdir(output_path) if os.path.isdir(os.path.join(output_path, name))]
+        
+            # camera_names 是提取帧后的所有相机目录名（例如 cam00, cam01, ...）。
+            # frame_list 是将要执行重建的帧编号（每隔 GOP 取一帧）。
+        # 如果：
+        #     startframe = 0
+        #     endframe = 300
+        #     GOP = 60
+        #     那么 frame_list = [0, 60, 120, 180, 240]
+        #     → 表示将分别对第 0, 60, 120, 180, 240 帧做 COLMAP 重建。
         camera_names = sorted(camera_names)
         frame_list = [args.startframe + x * args.GOP for x in range((args.endframe-args.startframe + args.GOP-1)//args.GOP)]
+        
+        # 🧩 Step 4：为每个重建帧准备输入图像
         for frame in frame_list:
             colmap_path = os.path.join(args.root_dir, folder_name, f"colmap_{frame}")
             first_frame_path = os.path.join(args.root_dir, folder_name, f"colmap_{frame}", "input")
@@ -229,6 +261,62 @@ if __name__ == "__main__" :
                 image_path = os.path.join(output_path, cam, f"{(frame+1):05d}.png")
                 save_path = os.path.join(first_frame_path, f"cam{ind:02d}.png")
                 shutil.copy(image_path, save_path)
-
+                
+            # 将 NeRF 的 poses_bounds.npy 转为 COLMAP 所需的数据库 input.db 和手动初始化的相机/图像信息（manual）
+            # 输入：
+            #     poses_bounds.npy: LLFF 格式，前15个 float 表示 3×5 的相机矩阵（3x3旋转 + 3x1位移 + 3x1 H/W/f）
+            # 过程：
+            #     进行若干步 pose 转换（LLFF → COLMAP 世界到相机）
+            #     写入：
+            #     images.txt：图像与位姿
+            #     cameras.txt：相机模型（PINHOLE）
+            #     points3D.txt：空，先不处理点
+            #     input.db：调用 COLMAP 的 add_camera()、add_image() 写入数据库
             convertdynerftocolmapdb(os.path.join(args.root_dir, folder_name),frame)
+
+            # 基于已有的 input.db 和图像，调用 COLMAP 完整跑一遍三维稀疏重建流程    
+            #     colmap feature_extractor：提取 SIFT 特征                
+            #     colmap exhaustive_matcher：全连接匹配特征点                
+            #     colmap point_triangulator：三角化恢复稀疏点云                
+            #     colmap image_undistorter：去畸变，得到 COLMAP 输出格式                
+            #     清除 input 图像
+            #     重命名 sparse/* 为 sparse/0
             getcolmapsinglen3d(os.path.join(args.root_dir, folder_name),frame)
+# Out：
+# scene1/
+# ├── colmap_60/
+# │   ├── input/                 ← 第60帧提取的图片
+# │   ├── input.db               ← COLMAP数据库
+# │   ├── manual/                ← 先验位姿和相机参数
+# │   ├── sparse/0/*.bin         ← 稀疏重建结果
+# │   └── images, cameras.txt    ← COLMAP标准格式
+# └── png/                       ← 所有提取的图像帧
+
+# scene_root/
+# └── your_scene_name/
+#     ├── png/
+#     │   └── cam00/00001.png
+#     │   └── cam01/00001.png
+#     │   └── ...
+#     ├── colmap_0/
+#     │   ├── input.db                # COLMAP 数据库文件，包含图像信息、特征、匹配等
+#     │   ├── manual/
+#     │   │   ├── images.txt          # 图像 pose 信息（手动构造的先验）
+#     │   │   ├── cameras.txt         # 相机内参（焦距、主点、图像尺寸）
+#     │   │   └── points3D.txt        # 空文件（占位）
+#     │   ├── distorted/
+#     │   │   └── sparse/
+#     │   │       ├── cameras.bin     # COLMAP 估计的相机参数（可能和先验略有不同）
+#     │   │       ├── images.bin      # COLMAP 估计的位姿（或者用先验初始化）
+#     │   │       └── points3D.bin    # 三维点云
+#     │   ├── sparse/
+#     │   │   └── 0/
+#     │   │       ├── cameras.bin     # 和上面相同，组织成 sparse/0/ 便于后续使用
+#     │   │       ├── images.bin
+#     │   │       └── points3D.bin
+#     │   └── undistorted images/poses if output_type=COLMAP
+
+
+
+
+
