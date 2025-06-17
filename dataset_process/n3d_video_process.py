@@ -183,6 +183,12 @@ def getcolmapsinglen3d(folder, offset):
         destination_file = os.path.join(folder, "sparse", "0", file)
         shutil.move(source_file, destination_file)
 
+# | 类型             | 路径示例                                           | 包含内容               |
+# | -------------- | ---------------------------------------------- | ------------------ |
+# | 所有帧图像（第 0～59）  | `your_scene/png/cam00/00001.png` 到 `00060.png` | 所有时间帧的图像（ffmpeg提取） |
+# | 用于 COLMAP 的关键帧 | `your_scene/colmap_0/input/cam00.png` 等        | 只包含 GOP 的第 0 帧图像   |
+
+
 #  主要功能概览
 # 从视频中提取图像帧（可选）
 # 构建 COLMAP 所需的输入数据结构
