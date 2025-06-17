@@ -246,16 +246,23 @@ def _world_to_cam(
     covars_c = torch.einsum("cij,njk,clk->cnil", R, covars, R)  # [C, N, 3, 3]
     return means_c, covars_c
 
+# 返回 5 个张量：
+# radii: 每个高斯在屏幕上的半径（用于判定可见性）
+# means2d: 每个高斯的屏幕坐标中心位置
+# depths: 每个高斯的深度（Z）
+# conics: 2D 椭圆参数（供渲染使用）
+# compensations: 补偿项（用于抗锯齿）
 
+# 高斯点被视为“可见”当且仅当它的 3D 坐标落在相机视锥内、投影后的二维半径合法且图像内有覆盖范围。
 def _fully_fused_projection(
-    means: Tensor,  # [N, 3]
-    covars: Tensor,  # [N, 3, 3]
-    viewmats: Tensor,  # [C, 4, 4]
-    Ks: Tensor,  # [C, 3, 3]
-    width: int,
+    means: Tensor,  # [N, 3] # [N, 3] 高斯中心点（世界坐标系）
+    covars: Tensor,  # [N, 3, 3]  # [N, 3, 3] 高斯协方差矩阵（世界坐标系） 
+    viewmats: Tensor,  # [C, 4, 4] # [C, 4, 4] 相机外参 
+    Ks: Tensor,  # [C, 3, 3] # [C, 3, 3] 相机内参 
+    width: int,  # 图像尺寸 
     height: int,
     eps2d: float = 0.3,
-    near_plane: float = 0.01,
+    near_plane: float = 0.01, # 添加到协方差的对角线稳定项 
     far_plane: float = 1e10,
     calc_compensations: bool = False,
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
@@ -267,8 +274,14 @@ def _fully_fused_projection(
         This is a minimal implementation of fully fused version, which has more
         arguments. Not all arguments are supported.
     """
+    # ① 坐标变换到相机空间
+    # 将 3D 高斯的中心点和协方差从世界坐标变换到每个相机的坐标系中，结果：
     means_c, covars_c = _world_to_cam(means, covars, viewmats)
 
+    # ② 透视投影（或正交、鱼眼）
+    # 将 3D 高斯投影为图像空间上的二维高斯，返回：
+    #     means2d: 2D 图像中心点坐标 [C, N, 2]
+    #     covars2d: 图像空间中的 2D 协方差矩阵 [C, N, 2, 2]
     if camera_model == "ortho":
         means2d, covars2d = _ortho_proj(means_c, covars_c, Ks, width, height)
     elif camera_model == "fisheye":
@@ -312,9 +325,13 @@ def _fully_fused_projection(
     # v2 = b - torch.sqrt(torch.clamp(b**2 - det, min=0.01))  # (...,)
     # radius = torch.ceil(3.0 * torch.sqrt(torch.max(v1, v2)))  # (...,)
 
+    # ⑨ 过滤非法点（深度 & 半径）
+        # 判断行列式有效（非退化）、在合法深度范围内
+        # 不满足的点，其半径设为0（即不参与后续可见性判断）
     valid = (det > 0) & (depths > near_plane) & (depths < far_plane)
     radius[~valid] = 0.0
 
+    # ⑩ 判断是否落在屏幕范围内
     inside = (
         (means2d[..., 0] + radius > 0)
         & (means2d[..., 0] - radius < width)
