@@ -291,7 +291,7 @@ class Config:
         else:
             assert_never(strategy)
 
-
+# 创建初始高斯锚点（splats）、构建解码器 MLP 网络、并分别配置优化器。
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -310,6 +310,8 @@ def create_splats_with_optimizers(
     world_size: int = 1,
     voxel_size: int = 0.001,
     anchor_feature_dim: int = 48,
+    
+    # n_offsets 是 GIFStream（或动态 3D Gaussian Splatting）中高斯分裂的数量参数，它控制了每个 anchor（锚点）衍生出多少个 可形变的高斯球。
     n_offsets: int = 5,
     use_feat_bank: bool = False,
     add_opacity_dist: bool = False,
@@ -321,22 +323,29 @@ def create_splats_with_optimizers(
     time_dim: int = 16,
     view_adaptive: bool = False
 ) -> Tuple[torch.nn.ParameterDict, torch.nn.ModuleDict, Dict[str, torch.optim.Optimizer], Dict[str, torch.optim.Optimizer]]:
+
+    # 对 SfM 或 COLMAP 提供的稠密点云做 voxel 化下采样，作为初始的高斯锚点。
     if init_type == "sfm":
         points = parser.points
         np.random.shuffle(points)
         points = torch.from_numpy(np.unique(np.round(points/voxel_size), axis=0)*voxel_size).float()
     else:
         raise ValueError("Now only Support SFM Initialization")
-
+        
+    # ② 初始 scale 估计（以最近邻为依据）
+    # 利用每个点的最近邻之间的平均距离，初始化六维高斯 scale（log 空间）。
+    # 🎯 目的：确定每个高斯球体的初始体积大小
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 6)  # [N, 6]
 
     # Distribute the GSs to different ranks (also works for single rank)
+    # ③ 多卡切分（world_size 支持）
     points = points[world_rank::world_size]
     scales = scales[world_rank::world_size]
 
+    
     N = points.shape[0]
     quats = torch.zeros((N, 4))  # [N, 4]
     quats[:,0] = 1
@@ -345,7 +354,18 @@ def create_splats_with_optimizers(
     offsets = torch.zeros((N, n_offsets, 3))
     time_features = torch.zeros((N, GOP_size, c_perframe))
     factors = torch.zeros((N, 4)) # [time_feature factor, motion_factor, knn_factor, pruning_factor]
-    
+
+    # 每个参数对应一个可学习属性：
+    # | 参数名                  | 含义                    | 维度                     | 说明                                                |
+    # | -------------------- | --------------------- | ---------------------- | ------------------------------------------------- |
+    # | **anchors**          | 高斯中心位置                | `[N, 3]`               | xyz 三维空间位置                                        |
+    # | **scales**           | 高斯尺寸（log 空间，6维）       | `[N, 6]`               | 对角协方差（3 主轴）+ 3 缩放因子（或冗余）                          |
+    # | **quats**            | 初始旋转四元数               | `[N, 4]`               | 用于初始方向，通常初始化为 `[1, 0, 0, 0]`                      |
+    # | **opacities**        | 初始透明度（经过 `sigmoid`）   | `[N, 1]`               | 用于渲染 alpha 混合                                     |
+    # | **offsets**          | motion 输出的空间偏移向量      | `[N, k, 3]`            | 每个 anchor 对应 `k` 个高斯分裂偏移（默认为 `k=5`）               |
+    # | **anchor\_features** | 输入 MLP 的 anchor 编码特征  | `[N, C_anchor]`        | `C_anchor = cfg.anchor_feature_dim`，如 `24 / 48` 等 |
+    # | **time\_features**   | 每帧的时序特征向量             | `[N, GOP, C_perframe]` | 每个 anchor 每帧一个时间向量                                |
+    # | **factors**          | 控制 motion / knn 等影响因子 | `[N, 4]`               | `[time_feature, motion, knn, pruning]` 四项权重控制项    |
     params = [
         # name, value, lr
         ("anchors", torch.nn.Parameter(points), 0),
@@ -357,7 +377,16 @@ def create_splats_with_optimizers(
         ("time_features", torch.nn.Parameter(time_features.requires_grad_(True)), 0.0075),
         ("factors", torch.nn.Parameter(factors.requires_grad_(True)), 1e-3),
     ]
-
+    
+    # | 项                      | 名称                  | 含义                                                   | 默认值（常见）         |
+    # | ---------------------- | ------------------- | ---------------------------------------------------- | --------------- |
+    # | ✅ `anchor_feature_dim` | 每个高斯 anchor 的语义特征维度 | 高斯点的基础描述特征（可学习）                                      | 通常是 `24` 或 `48` |
+    # | ✅ `view_dim`           | 视角方向编码维度            | 如果启用了视角自适应（`view_adaptive=True`），就把 view\_dir 加入进去   | `3` 或 `0`       |
+    # | ✅ `color_dist_dim`     | 颜色分布的辅助变量维度         | 如果启用了 `add_color_dist=True`，表示会额外拼接一个 `dist` 标量（如距离） | `1` 或 `0`       |
+    # | ✅ `app_embed_dim`      | 相机外观嵌入向量维度          | 启用了相机 appearance embedding 后，每个相机有个向量会拼进去            | 如 `6`           |
+    # | ✅ `c_perframe`         | 每帧的时间特征维度           | 表示该 anchor 在该时间帧下的 learnable time vector 维度          | 如 `4`、`8`       |
+    # ⑤ 初始化神经网络 MLP 解码器
+    # 这些是用来“解码” anchor + time 特征的：
     view_dim = 3 if view_adaptive else 0
     opacity_dist_dim = 1 if add_opacity_dist else 0
     mlp_opacity = torch.nn.Sequential(
@@ -392,6 +421,9 @@ def create_splats_with_optimizers(
     torch.nn.init.constant_(mlp_motion[-1].weight,0)
     torch.nn.init.constant_(mlp_motion[-1].bias,0)
 
+    # 最后 motion 输出的是：
+    #     3D offset（可加在 anchor 上）
+    #     4D rotation（用于旋转 offsets）
     net_params = [
         # name, value, lr
         ("mlp_opacity", mlp_opacity, 2e-3),
@@ -475,6 +507,8 @@ class Runner:
             start_frame=cfg.start_frame,
         )
         self.valset = Dataset(self.parser, split="val", test_set=cfg.test_set, remove_set=cfg.remove_set, GOP_size=cfg.GOP_size, start_frame=cfg.start_frame)
+        
+        # 定义了整个 3D 场景的统一缩放因子，用于规范化点云或高斯初始化的位置、大小等，是 GIFStream（或 GIFStream-Gaussian）中的一个 关键缩放设定。
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -512,6 +546,11 @@ class Runner:
         print("Model initialized. Number of Anchor:", len(self.splats["anchors"]))
 
         # Densification Strategy
+        # 🧠 作用是什么？
+        #     check_sanity() 方法通常是用于：
+        #     检查初始 splats 的结构是否符合预期
+        #     确保每个需要优化的参数（如 scales、offsets）在 optimizers 中注册了
+        #     防止训练过程报错或 silent failure
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
         if isinstance(self.cfg.strategy, GIFStreamStrategy):
@@ -525,15 +564,32 @@ class Runner:
             assert_never(self.cfg.strategy)
 
         # Compression Strategy
+        
         self.compression_method = None
         if cfg.compression is not None:
             if cfg.compression == "end2end":
+                # 使用 GIFStream 原生实现的端到端压缩策略（如熵建模 + 量化）。
                 self.compression_method = GIFStreamEnd2endCompression()
             elif cfg.compression == "2dcodec":
+                # 使用 2D 编码器（如 HEVC）将高斯参数压缩成图像格式。
                 self.compression_method = GIFStream2dcodecCompression()
             else:
                 raise ValueError(f"Unknown compression strategy: {cfg.compression}")
-        
+                
+        # ✅ 段落二：初始化压缩模拟器（compression simulation）
+            #         | 参数                   | 含义                                      |
+            # | -------------------- | --------------------------------------- |
+            # | `entropy_model_opt`  | 是否启用熵模型学习                               |
+            # | `entropy_model_type` | 熵模型类型（如 "conditional\_gaussian\_model"） |
+            # | `entropy_steps`      | 各参数开始使用熵模型的 step                        |
+            # | `device`             | 设备（GPU）                                 |
+            # | `cap_max`            | 对应策略的最大容量限制                             |
+            # | `feature_dim`        | anchor 特征维度                             |
+            # | `n_offsets`          | 每个 anchor 分裂出的高斯数量                      |
+            # | `c_channel`          | anchor 特征通道数                            |
+            # | `p_channel`          | time feature 通道数                        |
+            # | `scaling`            | 不同压缩率下的比例设置                             |
+            # | `max_steps`          | 训练总步数，用于调度                              |
         if cfg.compression_sim:
             cap_max = cfg.strategy.cap_max if cfg.strategy.cap_max is not None else None
             self.compression_sim_method = GIFStreamCompressionSimulation(cfg.entropy_model_opt,
@@ -552,6 +608,7 @@ class Runner:
                                                     max_steps=self.cfg.max_steps)
 
             if cfg.entropy_model_opt:
+                # 🧠 提前记录最小启用熵模型的 step：
                 selected_key = min((k for k, v in cfg.entropy_steps.items() if v > 0), key=lambda k: cfg.entropy_steps[k])
                 self.entropy_min_step = cfg.entropy_steps[selected_key]
         
@@ -580,6 +637,7 @@ class Runner:
         self.bil_grid_optimizers = []
 
         # Losses & Metrics.
+        # PyTorch Metric 库，用于计算训练/验证图像质量（SSIM, PSNR）
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
@@ -607,10 +665,25 @@ class Runner:
             self.indices = None
         self.istraining = False
 
+    # 🧠 目标
+    #         为每个高斯点设置一个可学习的 motion offset 激活权重，控制：
+    #         哪些点可以“动”
+    #         以及动得“多强”
+    #         用于指导 mlp_motion 的有效性与稀疏性。
     def init_dynamic(self) -> None:
+        
+        # 获取累计的 motion offset 梯度（2D）
+        # offset_grad2d：记录 offset 的梯度累积（可能来自 render 残差）
+        # offset_demon：可能是统计归一化因子（如每个点被采样的次数）
         grads = self.strategy_state["offset_grad2d"] / self.strategy_state["offset_demon"]
+
+        # 防止 NaN 梯度引发错误，设置为 0
         grads[grads.isnan()] = 0.0
+        
+        # 计算每个某点在多个 offset 分支上的平均梯度范数（motion 强度）
         grads_norm = torch.norm(grads, dim=-1).view((-1,self.cfg.n_offsets)).mean(dim=-1)
+
+        
         mini = grads_norm.min()
         maxi = grads_norm.max()
         grads_norm = ((grads_norm - mini) / (maxi - mini + 1e-6)).clamp(0.15, 1)
@@ -643,7 +716,10 @@ class Runner:
         step: int = -1,
         camera_ids: Tensor = None,
     )-> Dict:
+         # 时间步索引（将[0,1]归一化时间映射到GOP帧索引）
         feat_start = int(time * (self.cfg.GOP_size-1))
+
+        # coarse-to-fine策略：训练初期聚焦较宽时间范围
         # coarse to fine training for time-dependent features
         if step > 0 and self.istraining:
             gap = int((self.cfg.GOP_size // 5) * (1 - min(1, 5 * step / (self.cfg.max_steps - 1))))
@@ -656,7 +732,7 @@ class Runner:
         # consider dynamic gaussians which may be unselected (not visible in canonical space)
         # if step == -1 or step > self.cfg.max_steps // 6:
         #     visible_anchor_mask = torch.logical_or(visible_anchor_mask, torch.sigmoid(self.splats["factors"][:,1]) > 0.2 )
-
+        # 提取可见anchor对应的特征（压缩模拟与否）
         if not self.cfg.compression_sim:
             selected_features = self.splats["anchor_features"][visible_anchor_mask]  # [M, c]
             selected_anchors = self.splats["anchors"][visible_anchor_mask]  # [M, 3]
@@ -664,9 +740,11 @@ class Runner:
             selected_time_features = self.splats["time_features"][visible_anchor_mask][:,pre:aft].mean(dim=1) if aft - pre >1 else self.splats["time_features"][visible_anchor_mask][:,feat_start]# [M,T,C]
             factors = fake_quantize_factors(self.splats["factors"], q_aware=False)
             selected_factors = factors[visible_anchor_mask]
+
+            # 如果启用knn，则融合K近邻特征
             if self.cfg.knn:
                 if self.indices is None or self.indices.shape[0] != self.splats["anchors"].shape[0]:
-                    _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
+                        _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
                 selected_indices = self.indices[visible_anchor_mask].reshape(-1)
                 knn_features = self.splats["anchor_features"][selected_indices].reshape(-1,self.cfg.n_knn,self.cfg.anchor_feature_dim).mean(dim=1)
                 knn_time_features = (
@@ -674,6 +752,7 @@ class Runner:
                     (factors[:,0].unsqueeze(-1) if not canonical else 0)
                 )[selected_indices].reshape(-1,self.cfg.n_knn,self.cfg.c_perframe).mean(dim=1)
         else:
+            # 同上，但使用压缩模拟的splats
             selected_features = self.comp_sim_splats["anchor_features"][visible_anchor_mask]  # [M, c]
             selected_anchors = self.comp_sim_splats["anchors"][visible_anchor_mask]  # [M, 3]
             selected_scales = torch.exp(self.comp_sim_splats["scales"][visible_anchor_mask])  # [M, 6]
@@ -690,11 +769,13 @@ class Runner:
                     self.comp_sim_splats["factors"][:,0].unsqueeze(-1) if not canonical else 0)
                 )[selected_indices].reshape(-1, self.cfg.n_knn, self.cfg.c_perframe).mean(dim=1)
 
+        # 计算相机视角方向
         cam_pos = camtoworlds[:, :3, 3]
         view_dir = selected_anchors - cam_pos  
         length = view_dir.norm(dim=1, keepdim=True)
         view_dir_normalized = view_dir / length  
 
+        # 是否拼接view dir作为视角特征
         if self.cfg.view_adaptive:
             feature_view_dir = torch.cat([selected_features, view_dir_normalized], dim=1)
         else:
@@ -703,22 +784,30 @@ class Runner:
         if self.cfg.knn:
             knn_feature_view_dir = knn_features
 
+        # 计算时间embedding（使用sin/cos位置编码）
         i = torch.ones((1),dtype=torch.float32)
         time_embedding = torch.cat(
             [torch.sin(self.cfg.phi**n * torch.pi * i * time) for n in range(self.cfg.time_dim // 2)] + 
             [torch.cos(self.cfg.phi**n * torch.pi * i * time) for n in range(self.cfg.time_dim // 2)]
         ).to(self.splats["anchors"].device)
 
+        # 提取每个高斯点的4个调节因子
         time_feature_factor = selected_factors[:,0].unsqueeze(-1)
         motion_factor = selected_factors[:,1].unsqueeze(-1)
         knn_factor = selected_factors[:,2].unsqueeze(-1)
         pruning_factor = selected_factors[:,3].unsqueeze(-1)
 
+
+        # 对scale加上pruning控制
         selected_scales = torch.cat([selected_scales[:,:3], selected_scales[:,3:] * pruning_factor],dim=-1)
+
+        # canonical模式关闭动态分量
         if canonical:
             time_feature_factor = 0
             motion_factor = 0
             knn_factor = 0.5
+
+        # 时间适应特征融合（knn加权或直接拼接）
         if self.cfg.knn:
             time_adaptive_features = torch.cat([
                 feature_view_dir, 
@@ -737,6 +826,8 @@ class Runner:
                 selected_features, 
                 selected_time_features * time_feature_factor
             ],dim=-1)
+
+        # 拼接time embedding到motion MLP输入中
         time_adaptive_features_ = torch.cat([time_adaptive_features_, time_embedding.unsqueeze(0).expand((time_adaptive_features.shape[0],-1))],dim=1)
 
 
@@ -747,7 +838,7 @@ class Runner:
             time_adaptive_features
         )
         neural_opacity = neural_opacity.view(-1, 1) * pruning_factor.view(-1,1).expand((-1,k)).reshape((-1,1)) 
-
+        
         # Get color
         neural_colors = self.decoders["mlp_color"](
             torch.cat([time_adaptive_features, self.app_module(camera_ids).to(self.device).view((1,-1)).expand(time_adaptive_features.shape[0],-1)],dim=-1) if self.cfg.app_opt else time_adaptive_features
@@ -765,7 +856,7 @@ class Runner:
             time_adaptive_features_
         )  
         motion = motion * motion_factor
-
+        
         return {
             "neural_opacity":neural_opacity,
             "neural_colors":neural_colors,
@@ -808,7 +899,10 @@ class Runner:
         Returns:
             Dict: A dictionary containing the parameters of visible neural Gaussians, including means, colors, opacities, scales, rotations, and auxiliary losses.
         """
+
+        
         # Compute which anchors (Gaussians) are visible in the current view
+        # 1️⃣ 可见性筛选：计算哪些（anchor）对当前视图可见
         visible_anchor_mask = view_to_visible_anchors(
             means=self.splats["anchors"],
             quats=self.splats["quats"],
@@ -821,6 +915,7 @@ class Runner:
             rasterize_mode=rasterize_mode,
         )
 
+        # 2️⃣ 选择可见 anchor 和 offset
         # Select anchors and offsets for visible Gaussians
         if not self.cfg.compression_sim:
             selected_anchors = self.splats["anchors"][visible_anchor_mask]  # [M, 3]
@@ -829,7 +924,10 @@ class Runner:
             selected_anchors = self.comp_sim_splats["anchors"][visible_anchor_mask]  # [M, 3]
             selected_offsets = self.comp_sim_splats["offsets"][visible_anchor_mask]  # [M, k, 3]
 
+        
         # Decode neural features (opacity, color, scale/rotation, motion, etc.)
+         # 输入当前视角与时间，MLP 输出：
+            # neural_opacity, neural_colors, neural_scale_rot, motion, selected_scales, selected_factors
         results = self.decoding_features(
             camtoworlds,
             time,
@@ -838,6 +936,9 @@ class Runner:
             step,
             camera_ids,
         )
+        
+        # 4️⃣ 时间平滑损失（每隔几帧对比临近帧的预测）
+        # 📉 smooth_loss 用于防止动态属性随时间剧烈跳变（尤其是 motion 与颜色），增强时间一致性。
         # Compute smoothness loss by comparing with a nearby time step (every x steps)
         if not canonical and step % 4 == 0 and self.istraining:
             with torch.no_grad():
@@ -862,15 +963,25 @@ class Runner:
         motion = results["motion"]
         selected_scales = results["selected_scales"]
         selected_factors = results["selected_factors"]
-        
+
+        # 5️⃣ 解码输出展开并筛除无效高斯，🔍 只保留透明度大于 0 的高斯。
         # Mask out Gaussians with non-positive opacity (they do not contribute to rendering)
         neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
+        
         # Apply motion offset to anchor positions
+        # 6️⃣ 融合运动（motion）与 anchor 的初始位置
+        # 🧠 每个 anchor 的中心 + 可学习的时序偏移。
         anchor_offset = motion[:,-7:-4]
         selected_anchors += anchor_offset
+        
         # Compute anchor rotation from motion output (as quaternion)
+        # 7️⃣ 姿态旋转（四元数）解码并归一化
+        # 🎯 解码运动后的旋转（单位四元数），用于将 offset 从局部坐标转换到世界坐标。
         anchor_rot = torch.nn.functional.normalize(0.1 * motion[:,-4:] + torch.tensor([[1,0,0,0]],device="cuda"))
         anchor_rotation = quaternion_to_rotation_matrix(anchor_rot)
+
+        # 8️⃣ 将 offset 应用于 anchor：考虑 scale + 旋转
+        # 📌 offset * scale 后旋转，得到真正的偏移位置。
         # Transform offsets by scale and rotation
         selected_offsets = torch.bmm(selected_offsets.view(-1,self.cfg.n_offsets,3) * selected_scales.unsqueeze(1)[:,:,:3] ,anchor_rotation.reshape((-1,3,3)).transpose(1, 2)).reshape((-1,3))
         # Repeat scales and anchors for each offset
@@ -888,10 +999,14 @@ class Runner:
         anchors_repeated = anchors_repeated[neural_selection_mask]  # [M, 3]
 
         # Compute final scales and rotations
+        # 🔟 选取 scale + rotation
+        # 前半部分用 sigmoid 控制缩放（避免为负）
+        # 后半部分输出四元数再归一化为单位旋转
         scales = scales_repeated[:, 3:] * torch.sigmoid(selected_scale_rot[:, :3])
         rotation = torch.nn.functional.normalize(selected_scale_rot[:, 3:7])
 
         # Compute final means (positions) of Gaussians
+        # 9️⃣ offset 与 anchor 合并得到最终的高斯中心 mean
         offsets = selected_offsets  # [M, 3]
         means = anchors_repeated + offsets  # [M, 3]
 
@@ -985,6 +1100,8 @@ class Runner:
         return render_colors, render_alphas, info
 
     def train(self, init_step: int=0):
+        
+        # 标记处于训练模式，获取配置信息。
         self.istraining = True
         cfg = self.cfg
         device = self.device
@@ -992,13 +1109,15 @@ class Runner:
         world_size = self.world_size
 
         # Dump cfg.
+        # ② 保存当前配置到 YAML
         if world_rank == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
-
+        
         max_steps = cfg.max_steps
         init_step = init_step
 
+        # ③ 初始化优化器调度器（ExponentialLR）
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
@@ -1025,11 +1144,13 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+        # ⑤ 设置模型为训练状态
         self.decoders["mlp_opacity"].train()
         self.decoders["mlp_cov"].train()
         self.decoders["mlp_color"].train()
         self.decoders["mlp_motion"].train()
 
+        # ⑥ 启动 profiler（若启用）
         with self.get_profiler(self.writer) as prof:
             self.profiler = prof if self.profiler_config.enabled else None
 
@@ -1048,6 +1169,8 @@ class Runner:
                 except StopIteration:
                     trainloader_iter = iter(trainloader)
                     batch_data = next(trainloader_iter)
+
+                # 到达可学习 motion offset 的阶段，初始化 mlp_motion
                 if step == int(max_steps * self.cfg.strategy.deformation_gate):
                     self.init_dynamic()
                 
@@ -1061,6 +1184,8 @@ class Runner:
                         data = {}
                         for k,v in batch_data.items():
                             data[k] = v[batch_ind].unsqueeze(0)
+
+                    # 相机位姿、内参、像素图像、mask、camera_id 转移到 GPU
                     camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
                     Ks = data["K"].to(device)  # [1, 3, 3]
                     pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -1078,14 +1203,18 @@ class Runner:
                     sh_degree_to_use = None
 
                     # compression simulation
+                    # 建立 anchor bbox，用于空间哈希压缩模型
                     if cfg.compression_sim and cfg.entropy_model_opt and cfg.entropy_model_type == "gaussian_model": # if hash-based gaussian model, need to estiblish bbox
                         if step == self.entropy_min_step:
                             self.compression_sim_method._estiblish_bbox(self.splats["means"])
 
+                    # 对当前 splats 进行仿真压缩，生成新的 factors、估算 bpp 约束 loss
                     if cfg.compression_sim:
                         self.comp_sim_splats, self.esti_bits_dict = self.compression_sim_method.simulate_compression(self.splats, step, int(float(data["time"]) * (self.cfg.GOP_size - 1)), self.cfg.entropy_channel)
 
+                    
                     # forward
+                    # 核心渲染函数，返回渲染图像、alpha图、以及高斯参数 info（用于 loss 计算）
                     renders, alphas, info = self.rasterize_splats(
                         camtoworlds=camtoworlds,
                         Ks=Ks,
@@ -1121,6 +1250,7 @@ class Runner:
                         info=info,
                     )
 
+                    # 🧮 5.5 损失函数计算：
                     # loss
                     l1loss = F.l1_loss(colors, pixels)
                     ssimloss = 1.0 - fused_ssim(
@@ -1153,6 +1283,7 @@ class Runner:
                 desc = f"loss={loss_show.item():.3f}| " f"sh degree={sh_degree_to_use}| "
                 pbar.set_description(desc)
 
+                # 📊 6. TensorBoard 可视化
                 # tensorboard monitor
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                     mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1185,6 +1316,7 @@ class Runner:
                     self.writer.add_histogram("train_hist/means", self.splats["anchors"], step)
                     self.writer.flush()
 
+                # 💾 7. 保存 checkpoint
                 # save checkpoint before updating the model
                 if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                     mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1219,6 +1351,8 @@ class Runner:
                         data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                     )
 
+                # 🧹 8. 参数优化器 step：
+                # 所有 MLP、anchor 参数、entropy 模型优化器一起优化
                 # optimize
                 for optimizer in self.optimizers.values():
                     optimizer.step()
@@ -1245,6 +1379,7 @@ class Runner:
                             if scheduler is not None and step > cfg.entropy_steps[name]:
                                 scheduler.step()
 
+                # 🔁 9. Strategy 后处理 / 精化 / 近邻更新：
                 # Run post-backward steps after backward and optimizer
                 if isinstance(self.cfg.strategy, GIFStreamStrategy):
                     self.cfg.strategy.step_post_backward(
@@ -1265,10 +1400,12 @@ class Runner:
                     and step % self.cfg.strategy.refine_every == 0
                     and self.cfg.knn
                 ):
+                    # GIFStreamStrategy 中执行可学习权重裁剪、分裂等操作
                     _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
 
                 self.step_profiler()
 
+                # 🧪 10. 评估 & 渲染 & 压缩执行：
                 # eval the full set
                 if step in [i - 1 for i in cfg.eval_steps]:
                     self.eval(step)
@@ -1603,11 +1740,13 @@ class Runner:
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    # 若使用多卡训练，为避免冲突，关闭交互式 viewer。
     if world_size > 1 and not cfg.disable_viewer:
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
 
+    # Runner 是整个训练或评估流程的引擎核心，封装了数据加载、模型构建、前向渲染、反向优化、评估、可视化等功能。
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
     if cfg.ckpt is not None:
@@ -1646,6 +1785,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.app_module.load_state_dict(ckpts[0]["app_module"])
             runner.train(init_step=7001)
     else:
+        # 4. 否则进行从零训练
         runner.train()
 
     if not cfg.disable_viewer:
